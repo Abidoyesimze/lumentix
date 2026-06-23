@@ -5,7 +5,10 @@ use crate::types::{
     EnvironmentalImpact, Event, EventMerchandise, EventReview, IdentityCredential,
     IdentityProvider, InsurancePolicy, InsurancePool, NftCollectible, OrganizerReputation, Seat,
     Ticket, TicketTransferRecord, UpgradeGovernanceConfig, UpgradeProposal, UpgradeVote,
+    VenueLayout, VipTier, WaitlistOffer, PricingSchedule, MintGasUsage, StreamDeliveryConfig,
+    StreamPerformanceMetrics, INSTANCE_LIFETIME, PERSISTENT_LIFETIME,
     VenueLayout, VipTier, WaitlistOffer, INSTANCE_LIFETIME, PERSISTENT_LIFETIME,
+    VenueSpaceAllocation, SubscriptionPlan, SubscriptionStatus, SecurityIncident, UserPreferences,
 };
 use soroban_sdk::{Address, BytesN, Env, String, Vec};
 
@@ -32,6 +35,10 @@ const WAITLIST_QUEUE_PREFIX: &str = "WQUEUE_";
 const WAITLIST_OFFER_PREFIX: &str = "WOFFER_";
 const WAITLIST_OFFER_RECIPIENTS_PREFIX: &str = "WOFRECS_";
 const WAITLIST_RESERVED_PREFIX: &str = "WRESV_";
+const PRICING_SCHEDULE_PREFIX: &str = "PRSCHED_";
+const MINT_GAS_PREFIX: &str = "MINTGAS_";
+const STREAM_DELIVERY_PREFIX: &str = "STRMDEL_";
+const STREAM_PERF_PREFIX: &str = "STRMPERF_";
 const INSURANCE_POLICY_PREFIX: &str = "INSPOL_";
 const INSURANCE_POLICY_ID_COUNTER: &str = "INSPOL_CTR";
 const INSURANCE_POOL: &str = "INSPOOL";
@@ -39,6 +46,13 @@ const REVIEW_PREFIX: &str = "REVIEW_";
 const REVIEW_ID_COUNTER: &str = "REVIEW_CTR";
 const REVIEWER_EVENT_PREFIX: &str = "REVEVT_";
 const ORGANIZER_REPUTATION_PREFIX: &str = "ORGREP_";
+const VENUE_ALLOC_PREFIX: &str = "VENAL_";
+const SUB_PLAN_PREFIX: &str = "SUBPL_";
+const SUB_STATUS_PREFIX: &str = "SUBST_";
+const PLAN_ID_COUNTER: &str = "PLAN_CTR";
+const INCIDENT_PREFIX: &str = "INC_";
+const INCIDENT_COUNTER: &str = "INC_CTR";
+const USER_PREFS_PREFIX: &str = "UPREF_";
 
 /// Check if contract is initialized
 pub fn is_initialized(env: &Env) -> bool {
@@ -585,6 +599,113 @@ pub fn set_waitlist_reserved(env: &Env, event_id: u64, reserved: u32) {
     env.storage()
         .persistent()
         .extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PRICING SCHEDULE STORAGE
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn set_pricing_schedule(env: &Env, event_id: u64, schedule: &PricingSchedule) {
+    let key = (PRICING_SCHEDULE_PREFIX, event_id);
+    env.storage().persistent().set(&key, schedule);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+}
+
+pub fn get_pricing_schedule(env: &Env, event_id: u64) -> Option<PricingSchedule> {
+    let key = (PRICING_SCHEDULE_PREFIX, event_id);
+    let schedule: Option<PricingSchedule> = env.storage().persistent().get(&key);
+    if schedule.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+    }
+    schedule
+}
+
+pub fn has_pricing_schedule(env: &Env, event_id: u64) -> bool {
+    let key = (PRICING_SCHEDULE_PREFIX, event_id);
+    env.storage().persistent().has(&key)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MINT GAS TRACKING STORAGE
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn get_mint_gas_usage(env: &Env, event_id: u64) -> MintGasUsage {
+    let key = (MINT_GAS_PREFIX, event_id);
+    let usage: MintGasUsage = env.storage().persistent().get(&key).unwrap_or(MintGasUsage {
+        total_mints: 0,
+        total_tickets_minted: 0,
+        total_resource_units: 0,
+        last_batch_quantity: 0,
+        last_batch_resource_units: 0,
+        last_updated: 0,
+    });
+    if env.storage().persistent().has(&key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+    }
+    usage
+}
+
+pub fn record_mint_gas_usage(env: &Env, event_id: u64, quantity: u32, resource_units: u64) {
+    let key = (MINT_GAS_PREFIX, event_id);
+    let mut usage = get_mint_gas_usage(env, event_id);
+    usage.total_mints = usage.total_mints.saturating_add(1);
+    usage.total_tickets_minted = usage.total_tickets_minted.saturating_add(quantity);
+    usage.total_resource_units = usage.total_resource_units.saturating_add(resource_units);
+    usage.last_batch_quantity = quantity;
+    usage.last_batch_resource_units = resource_units;
+    usage.last_updated = env.ledger().timestamp();
+    env.storage().persistent().set(&key, &usage);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STREAMING DELIVERY STORAGE
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn set_stream_delivery_config(env: &Env, event_id: u64, config: &StreamDeliveryConfig) {
+    let key = (STREAM_DELIVERY_PREFIX, event_id);
+    env.storage().persistent().set(&key, config);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+}
+
+pub fn get_stream_delivery_config(env: &Env, event_id: u64) -> Option<StreamDeliveryConfig> {
+    let key = (STREAM_DELIVERY_PREFIX, event_id);
+    let config: Option<StreamDeliveryConfig> = env.storage().persistent().get(&key);
+    if config.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+    }
+    config
+}
+
+pub fn set_stream_performance_metrics(env: &Env, event_id: u64, metrics: &StreamPerformanceMetrics) {
+    let key = (STREAM_PERF_PREFIX, event_id);
+    env.storage().persistent().set(&key, metrics);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+}
+
+pub fn get_stream_performance_metrics(env: &Env, event_id: u64) -> Option<StreamPerformanceMetrics> {
+    let key = (STREAM_PERF_PREFIX, event_id);
+    let metrics: Option<StreamPerformanceMetrics> = env.storage().persistent().get(&key);
+    if metrics.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+    }
+    metrics
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1368,4 +1489,114 @@ pub fn get_collectible_inventory(
 pub fn has_collectible_inventory(env: &Env, event_id: u64) -> bool {
     let key = (COLLECTIBLE_INVENTORY_PREFIX, event_id);
     env.storage().persistent().has(&key)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Dynamic Venue Space Allocation Storage Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn set_venue_space_allocation(env: &Env, event_id: u64, venue_id: &String, space_id: &String, alloc: &VenueSpaceAllocation) {
+    let key = (VENUE_ALLOC_PREFIX, event_id, venue_id.clone(), space_id.clone());
+    env.storage().persistent().set(&key, alloc);
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+}
+
+pub fn get_venue_space_allocation(env: &Env, event_id: u64, venue_id: &String, space_id: &String) -> Result<VenueSpaceAllocation, LumentixError> {
+    let key = (VENUE_ALLOC_PREFIX, event_id, venue_id.clone(), space_id.clone());
+    let alloc = env.storage().persistent().get(&key).ok_or(LumentixError::VenueSpaceAllocationNotFound)?;
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+    Ok(alloc)
+}
+
+pub fn has_venue_space_allocation(env: &Env, event_id: u64, venue_id: &String, space_id: &String) -> bool {
+    let key = (VENUE_ALLOC_PREFIX, event_id, venue_id.clone(), space_id.clone());
+    env.storage().persistent().has(&key)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Subscription-Based Access Passes Storage Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn get_next_plan_id(env: &Env) -> u64 {
+    let id = env.storage().instance().get(&PLAN_ID_COUNTER).unwrap_or(1);
+    env.storage().instance().extend_ttl(INSTANCE_LIFETIME, INSTANCE_LIFETIME);
+    id
+}
+
+pub fn increment_plan_id(env: &Env) {
+    let next_id = get_next_plan_id(env) + 1;
+    env.storage().instance().set(&PLAN_ID_COUNTER, &next_id);
+    env.storage().instance().extend_ttl(INSTANCE_LIFETIME, INSTANCE_LIFETIME);
+}
+
+pub fn set_subscription_plan(env: &Env, plan_id: u64, plan: &SubscriptionPlan) {
+    let key = (SUB_PLAN_PREFIX, plan_id);
+    env.storage().persistent().set(&key, plan);
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+}
+
+pub fn get_subscription_plan(env: &Env, plan_id: u64) -> Result<SubscriptionPlan, LumentixError> {
+    let key = (SUB_PLAN_PREFIX, plan_id);
+    let plan = env.storage().persistent().get(&key).ok_or(LumentixError::SubscriptionPlanNotFound)?;
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+    Ok(plan)
+}
+
+pub fn set_subscription_status(env: &Env, subscriber: &Address, plan_id: u64, status: &SubscriptionStatus) {
+    let key = (SUB_STATUS_PREFIX, subscriber.clone(), plan_id);
+    env.storage().persistent().set(&key, status);
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+}
+
+pub fn get_subscription_status(env: &Env, subscriber: &Address, plan_id: u64) -> Result<SubscriptionStatus, LumentixError> {
+    let key = (SUB_STATUS_PREFIX, subscriber.clone(), plan_id);
+    let status = env.storage().persistent().get(&key).ok_or(LumentixError::SubscriptionInactive)?;
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+    Ok(status)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Comprehensive Security Monitoring Storage Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn get_next_incident_id(env: &Env) -> u64 {
+    let id = env.storage().instance().get(&INCIDENT_COUNTER).unwrap_or(1);
+    env.storage().instance().extend_ttl(INSTANCE_LIFETIME, INSTANCE_LIFETIME);
+    id
+}
+
+pub fn increment_incident_id(env: &Env) {
+    let next_id = get_next_incident_id(env) + 1;
+    env.storage().instance().set(&INCIDENT_COUNTER, &next_id);
+    env.storage().instance().extend_ttl(INSTANCE_LIFETIME, INSTANCE_LIFETIME);
+}
+
+pub fn set_security_incident(env: &Env, incident_id: u64, incident: &SecurityIncident) {
+    let key = (INCIDENT_PREFIX, incident_id);
+    env.storage().persistent().set(&key, incident);
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+}
+
+pub fn get_security_incident(env: &Env, incident_id: u64) -> Result<SecurityIncident, LumentixError> {
+    let key = (INCIDENT_PREFIX, incident_id);
+    let incident = env.storage().persistent().get(&key).ok_or(LumentixError::SecurityIncidentNotFound)?;
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+    Ok(incident)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Personalization Engine Storage Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn set_user_preferences(env: &Env, user: &Address, prefs: &UserPreferences) {
+    let key = (USER_PREFS_PREFIX, user.clone());
+    env.storage().persistent().set(&key, prefs);
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+}
+
+pub fn get_user_preferences(env: &Env, user: &Address) -> Result<UserPreferences, LumentixError> {
+    let key = (USER_PREFS_PREFIX, user.clone());
+    let prefs = env.storage().persistent().get(&key).ok_or(LumentixError::Unauthorized)?;
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME, PERSISTENT_LIFETIME);
+    Ok(prefs)
 }

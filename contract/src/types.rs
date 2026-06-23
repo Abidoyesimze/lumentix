@@ -170,6 +170,64 @@ pub struct WaitlistOffer {
     pub expires_at: u64,
 }
 
+// ── Dynamic pricing ────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PriceTier {
+    EarlyBird,
+    Standard,
+    Late,
+    LastMinute,
+}
+
+/// Organizer-configurable multipliers (basis points) for time-based pricing.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PricingSchedule {
+    pub early_bird_multiplier_bps: u32,
+    pub standard_multiplier_bps: u32,
+    pub late_multiplier_bps: u32,
+    pub last_minute_multiplier_bps: u32,
+    pub early_bird_days: u32,
+    pub standard_days: u32,
+    pub last_minute_hours: u32,
+}
+
+/// Rolling batch-mint resource usage snapshot for fee optimization.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MintGasUsage {
+    pub total_mints: u32,
+    pub total_tickets_minted: u32,
+    pub total_resource_units: u64,
+    pub last_batch_quantity: u32,
+    pub last_batch_resource_units: u64,
+    pub last_updated: u64,
+}
+
+/// CDN / adaptive streaming delivery configuration for hybrid events.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamDeliveryConfig {
+    pub cdn_endpoint: String,
+    pub stream_url: String,
+    pub quality_profile: String,
+    pub adaptive_bitrate: bool,
+    pub target_bitrate_kbps: u32,
+}
+
+/// Observed streaming performance metrics for virtual attendees.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamPerformanceMetrics {
+    pub event_id: u64,
+    pub avg_bitrate_kbps: u32,
+    pub rebuffer_ratio_bps: u32,
+    pub concurrent_viewers: u32,
+    pub quality_score: u32,
+    pub last_measured_at: u64,
+}
 // ── Insurance System ───────────────────────────────────────────────────────
 
 /// Cancellation reason enum for insurance claims
@@ -476,4 +534,70 @@ pub struct CollectibleInventory {
     pub rare_minted: u32,
     pub epic_minted: u32,
     pub legendary_minted: u32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Dynamic Venue Space Allocation
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VenueSpaceAllocation {
+    pub event_id: u64,
+    pub venue_id: String,
+    pub space_id: String,
+    pub allocated_capacity: u32,
+    pub real_time_demand: u32,
+    pub is_optimized: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Subscription-Based Access Passes
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPlan {
+    pub plan_id: u64,
+    pub event_series_id: u64,
+    pub name: String,
+    pub price: i128,
+    pub billing_interval: u64,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionStatus {
+    pub subscriber: Address,
+    pub plan_id: u64,
+    pub expiration_time: u64,
+    pub active: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Comprehensive Security Monitoring
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityIncident {
+    pub incident_id: u64,
+    pub affected_address: Address,
+    pub threat_level: String,
+    pub description: String,
+    pub timestamp: u64,
+    pub resolved: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Personalization Engine
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserPreferences {
+    pub user: Address,
+    pub preferred_categories: Vec<String>,
+    pub max_price: i128,
 }

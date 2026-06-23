@@ -35,13 +35,14 @@ fn create_and_publish_event(
     client: &LumentixContractClient,
     organizer: &Address,
 ) -> u64 {
+    let now = env.ledger().timestamp();
     let event_id = client.create_event(
         organizer,
         &String::from_str(env, "Test Event"),
         &String::from_str(env, "Description"),
         &String::from_str(env, "Location"),
-        &1000u64,
-        &2000u64,
+        &(now + 1_000),
+        &(now + 2_000),
         &100i128,
         &50u32,
     );
@@ -5463,28 +5464,42 @@ fn test_calculate_dynamic_price_time_tiers() {
     let organizer = Address::generate(&env);
 
     env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let start_far = 1_000 + (31 * 24 * 60 * 60);
     let event_id = client.create_event(
         &organizer,
         &String::from_str(&env, "Dynamic"),
         &String::from_str(&env, "Pricing"),
         &String::from_str(&env, "Venue"),
-        &2_000u64,
-        &(1_000 + (31 * 24 * 60 * 60)),
+        &start_far,
+        &(start_far + 3_600),
         &100i128,
         &100u32,
     );
     client.update_event_status(&event_id, &EventStatus::Published, &organizer);
 
+    use crate::types::PricingSchedule;
+    let schedule = PricingSchedule {
+        early_bird_multiplier_bps: 8_000,
+        standard_multiplier_bps: 10_000,
+        late_multiplier_bps: 10_000,
+        last_minute_multiplier_bps: 15_000,
+        early_bird_days: 30,
+        standard_days: 7,
+        last_minute_hours: 24,
+    };
+    assert!(client
+        .try_set_pricing_schedule(&organizer, &event_id, &schedule)
+        .is_ok());
     let early = client.calculate_dynamic_price(&event_id, &0u32, &3600u64);
     assert_eq!(early, 80i128);
 
     env.ledger()
-        .with_mut(|li| li.timestamp = 1_000 + (10 * 24 * 60 * 60));
+        .with_mut(|li| li.timestamp = start_far - (10 * 24 * 60 * 60));
     let normal = client.calculate_dynamic_price(&event_id, &0u32, &3600u64);
     assert_eq!(normal, 100i128);
 
     env.ledger()
-        .with_mut(|li| li.timestamp = (1_000 + (31 * 24 * 60 * 60)) - (12 * 60 * 60));
+        .with_mut(|li| li.timestamp = start_far - (12 * 60 * 60));
     let last_minute = client.calculate_dynamic_price(&event_id, &0u32, &3600u64);
     assert_eq!(last_minute, 150i128);
 }
@@ -5504,8 +5519,8 @@ fn test_waitlist_fifo_offer_and_reserved_capacity() {
         &String::from_str(&env, "Waitlist Event"),
         &String::from_str(&env, "Desc"),
         &String::from_str(&env, "Loc"),
-        &1000u64,
-        &2000u64,
+        &(env.ledger().timestamp() + 1_000),
+        &(env.ledger().timestamp() + 2_000),
         &100i128,
         &1u32,
     );
@@ -5530,6 +5545,102 @@ fn test_waitlist_fifo_offer_and_reserved_capacity() {
         .is_ok());
 }
 
+#[test]
+fn test_pricing_schedule_and_current_tier() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = create_test_contract(&env);
+    let organizer = Address::generate(&env);
+
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let event_id = client.create_event(
+        &organizer,
+        &String::from_str(&env, "Tiered"),
+        &String::from_str(&env, "Desc"),
+        &String::from_str(&env, "Loc"),
+        &(1_000 + (10 * 24 * 60 * 60)),
+        &(1_000 + (11 * 24 * 60 * 60)),
+        &100i128,
+        &50u32,
+    );
+    client.update_event_status(&event_id, &EventStatus::Published, &organizer);
+
+    use crate::types::{PriceTier, PricingSchedule};
+    let schedule = PricingSchedule {
+        early_bird_multiplier_bps: 8_000,
+        standard_multiplier_bps: 10_000,
+        late_multiplier_bps: 10_000,
+        last_minute_multiplier_bps: 15_000,
+        early_bird_days: 30,
+        standard_days: 7,
+        last_minute_hours: 24,
+    };
+    assert!(client
+        .try_set_pricing_schedule(&organizer, &event_id, &schedule)
+        .is_ok());
+
+    let tier = client.get_current_price_tier(&event_id);
+    assert_eq!(tier, PriceTier::Standard);
+
+    let price = client.calculate_dynamic_price(&event_id, &0u32, &3600u64);
+    assert_eq!(price, 100i128);
+}
+
+#[test]
+fn test_mint_batch_tickets_tracks_gas_usage() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = create_test_contract(&env);
+    let organizer = Address::generate(&env);
+    let buyer = Address::generate(&env);
+
+    let event_id = create_and_publish_event(&env, &client, &organizer);
+    let optimal = client.optimize_mint_gas(&event_id, &3u32);
+    assert!(optimal >= 1);
+
+    let ticket_ids = client.mint_batch_tickets(&event_id, &3u32, &buyer);
+    assert_eq!(ticket_ids.len(), 3);
+
+    let usage = client.track_mint_gas_usage(&event_id);
+    assert_eq!(usage.total_mints, 1);
+    assert_eq!(usage.total_tickets_minted, 3);
+    assert!(usage.total_resource_units > 0);
+}
+
+#[test]
+fn test_hybrid_streaming_delivery_and_performance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = create_test_contract(&env);
+    let organizer = Address::generate(&env);
+
+    let event_id = client.create_hybrid_event(
+        &organizer,
+        &String::from_str(&env, "Hybrid Conf"),
+        &100i128,
+        &100u32,
+        &1_000_000u64,
+        &2_000_000u64,
+        &String::from_str(&env, "https://cdn.example/live/master.m3u8"),
+    );
+    client.update_event_status(&event_id, &EventStatus::Published, &organizer);
+
+    let delivery = client.manage_content_delivery(
+        &organizer,
+        &event_id,
+        &String::from_str(&env, "https://cdn.lumentix.example"),
+        &String::from_str(&env, "https://stream.lumentix.example/live.m3u8"),
+        &String::from_str(&env, "auto"),
+    );
+    assert_eq!(delivery.target_bitrate_kbps, 2_500);
+
+    let tuned = client.optimize_stream_quality(&organizer, &event_id, &4_500u32);
+    assert_eq!(tuned.target_bitrate_kbps, 4_500);
+
+    let metrics = client.monitor_streaming_performance(&event_id, &3_800u32, &150u32, &42u32);
+    assert_eq!(metrics.concurrent_viewers, 42);
+    assert!(metrics.quality_score >= 60);
+}
 // ============================================================================
 // ADMINISTRATIVE OVERSIGHT OPERATIONS TESTS
 // ============================================================================
@@ -5818,6 +5929,156 @@ fn test_extend_event_end_time_success() {
 
     let event_id = create_and_publish_event(&env, &client, &organizer);
 
+    // Extend end time from 2000 to 3000
+    let result = client.try_extend_event_end_time(&organizer, &event_id, &3000u64);
+    assert!(result.is_ok());
+
+    let event = client.get_event(&event_id);
+    assert_eq!(event.end_time, 3000u64);
+}
+
+#[test]
+fn test_extend_event_end_time_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_admin, client) = create_test_contract(&env);
+    let organizer = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let event_id = create_and_publish_event(&env, &client, &organizer);
+
+    let result = client.try_extend_event_end_time(&attacker, &event_id, &3000u64);
+    assert_eq!(result, Err(Ok(LumentixError::Unauthorized)));
+
+    // End time must remain unchanged
+    let event = client.get_event(&event_id);
+    assert_eq!(event.end_time, 2000u64);
+}
+
+#[test]
+fn test_extend_event_end_time_draft_event_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_admin, client) = create_test_contract(&env);
+    let organizer = Address::generate(&env);
+
+    // Create but do NOT publish — stays Draft
+    let event_id = client.create_event(
+        &organizer,
+        &String::from_str(&env, "Draft Event"),
+        &String::from_str(&env, "Desc"),
+        &String::from_str(&env, "Loc"),
+        &1000u64,
+        &2000u64,
+        &100i128,
+        &50u32,
+    );
+
+    let result = client.try_extend_event_end_time(&organizer, &event_id, &3000u64);
+    assert_eq!(result, Err(Ok(LumentixError::InvalidStatusTransition)));
+}
+
+#[test]
+fn test_extend_event_end_time_new_time_not_after_current_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_admin, client) = create_test_contract(&env);
+    let organizer = Address::generate(&env);
+
+    let event_id = create_and_publish_event(&env, &client, &organizer);
+
+    // Same end time — must fail
+    let same = client.try_extend_event_end_time(&organizer, &event_id, &2000u64);
+    assert_eq!(same, Err(Ok(LumentixError::InvalidTimeRange)));
+
+    // Earlier end time — must also fail
+    let earlier = client.try_extend_event_end_time(&organizer, &event_id, &1500u64);
+    assert_eq!(earlier, Err(Ok(LumentixError::InvalidTimeRange)));
+}
+
+#[test]
+fn test_extend_event_end_time_allows_completion_at_new_time() {
+    // After extending end_time, the event must NOT be completable before the new
+    // end_time but MUST be completable after it.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_admin, client) = create_test_contract(&env);
+    let organizer = Address::generate(&env);
+
+    let event_id = create_and_publish_event(&env, &client, &organizer);
+
+    // Extend end time to 4000
+    client.extend_event_end_time(&organizer, &event_id, &4000u64);
+
+    // Timestamp just past original end (2001) — should still fail
+    env.ledger().with_mut(|li| li.timestamp = 2001);
+    let too_early = client.try_complete_event(&organizer, &event_id);
+    assert_eq!(too_early, Err(Ok(LumentixError::InvalidStatusTransition)));
+
+    // Timestamp past new end (4001) — should succeed
+    env.ledger().with_mut(|li| li.timestamp = 4001);
+    let result = client.try_complete_event(&organizer, &event_id);
+    assert!(result.is_ok());
+
+    let event = client.get_event(&event_id);
+    assert_eq!(event.status, EventStatus::Completed);
+}
+
+#[test]
+fn test_extend_event_end_time_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_admin, client) = create_test_contract(&env);
+    let organizer = Address::generate(&env);
+
+    let event_id = create_and_publish_event(&env, &client, &organizer);
+    client.extend_event_end_time(&organizer, &event_id, &5000u64);
+
+    // Verify EventTimeExtended was emitted with topic "evtextnd"
+    let events = env.events().all();
+    let mut found = false;
+    for xdr_event in events.events() {
+        if let xdr::ContractEventBody::V0(body) = &xdr_event.body {
+            if let xdr::ScVal::Symbol(topic_sym) = &body.topics[0] {
+                if topic_sym.as_slice() == b"evtextnd" {
+                    found = true;
+                    // Verify data: (event_id, previous_end_time, new_end_time)
+                    if let xdr::ScVal::Vec(Some(data_vec)) = &body.data {
+                        assert_eq!(
+                            data_vec.len(),
+                            3,
+                            "EventTimeExtended must carry (event_id, previous_end_time, new_end_time)"
+                        );
+                    } else {
+                        panic!("Expected Vec data for EventTimeExtended");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    assert!(found, "EventTimeExtended event not emitted");
+}
+
+// ============================================================================
+// AUTH CONSTRAINTS TESTS
+// ============================================================================
+
+#[test]
+fn test_extend_event_end_time_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_admin, client) = create_test_contract(&env);
+    let organizer = Address::generate(&env);
+
+    let event_id = create_and_publish_event(&env, &client, &organizer);
+
     let result = client.try_extend_event_end_time(&organizer, &event_id, &88400u64);
     assert!(result.is_ok());
 
@@ -5958,13 +6219,14 @@ fn test_extend_event_end_time_emits_event() {
     let event_id = create_and_publish_event(&env, &client, &organizer);
     client.extend_event_end_time(&organizer, &event_id, &5000u64);
 
-    // Verify EventTimeExtended was emitted with topic "evtextnd"
+    // Verify EventTimeExtended was emitted with topic "timeext"
     let events = env.events().all();
     let mut found = false;
     for xdr_event in events.events() {
         if let xdr::ContractEventBody::V0(body) = &xdr_event.body {
             if let xdr::ScVal::Symbol(topic_sym) = &body.topics[0] {
-                if topic_sym.as_slice() == b"evtextnd" {
+            if let Some(xdr::ScVal::Symbol(topic_sym)) = body.topics.first() {
+                if topic_sym.as_slice() == b"timeext" {
                     found = true;
                     // Verify data: (event_id, previous_end_time, new_end_time)
                     if let xdr::ScVal::Vec(Some(data_vec)) = &body.data {
@@ -6118,6 +6380,32 @@ fn find_event_by_topic(env: &Env, needle: &[u8]) -> Option<xdr::ScVal> {
     None
 }
 
+fn capacity_change_from_event(data: xdr::ScVal) -> (u32, u32) {
+    if let xdr::ScVal::Vec(Some(fields)) = data {
+        let old = match &fields[1] {
+            xdr::ScVal::U32(v) => *v,
+            other => panic!("expected U32 for old_capacity, got {:?}", other),
+        };
+        let new = match &fields[2] {
+            xdr::ScVal::U32(v) => *v,
+            other => panic!("expected U32 for new_capacity, got {:?}", other),
+        };
+        (old, new)
+    } else {
+        panic!("EventCapacityChanged data must be a Vec");
+    }
+}
+
+fn metadata_timestamp_from_event(data: xdr::ScVal) -> u64 {
+    if let xdr::ScVal::Vec(Some(fields)) = data {
+        match &fields[2] {
+            xdr::ScVal::U64(v) => *v,
+            other => panic!("expected U64 for time_updated, got {:?}", other),
+        }
+    } else {
+        panic!("EventMetadataUpdated data must be a Vec");
+    }
+}
 /// EventMetadataUpdated emits the correct event_id as the first data field.
 #[test]
 fn test_event_metadata_updated_emits_correct_event_id() {
@@ -6339,6 +6627,13 @@ fn test_event_metadata_updated_successive_updates_emit_independent_events_with_f
         &100i128,
         &50u32,
     );
+    let first_meta = find_event_by_topic(&env, b"evtmeta").expect("first evtmeta not emitted");
+    assert_eq!(
+        metadata_timestamp_from_event(first_meta),
+        1000,
+        "first event time_updated must be 1000"
+    );
+    let events1 = env.events().all();
 
     // ── Second update at t=2000 ───────────────────────────────────────────────
     env.ledger().with_mut(|li| li.timestamp = 2000);
@@ -6353,18 +6648,37 @@ fn test_event_metadata_updated_successive_updates_emit_independent_events_with_f
         &100i128,
         &50u32,
     );
+    let second_meta = find_event_by_topic(&env, b"evtmeta").expect("second evtmeta not emitted");
+    assert_eq!(
+        metadata_timestamp_from_event(second_meta),
+        2000,
+        "second event time_updated must be 2000"
+    );
+    let events2 = env.events().all();
 
     // Both emissions must be present – collect all "evtmeta" events in order
-    let mut timestamps = soroban_sdk::Vec::new(&env);
     extern crate alloc;
     let mut timestamps: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    for xdr_event in env.events().all().events() {
+    for xdr_event in events1.events() {
         if let xdr::ContractEventBody::V0(body) = &xdr_event.body {
             if let Some(xdr::ScVal::Symbol(sym)) = body.topics.first() {
                 if sym.as_slice() == b"evtmeta" {
                     if let xdr::ScVal::Vec(Some(fields)) = &body.data {
                         if let xdr::ScVal::U64(ts) = &fields[2] {
-                            timestamps.push_back(*ts);
+                            timestamps.push(*ts);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for xdr_event in events2.events() {
+        if let xdr::ContractEventBody::V0(body) = &xdr_event.body {
+            if let Some(xdr::ScVal::Symbol(sym)) = body.topics.first() {
+                if sym.as_slice() == b"evtmeta" {
+                    if let xdr::ScVal::Vec(Some(fields)) = &body.data {
+                        if let xdr::ScVal::U64(ts) = &fields[2] {
+                            timestamps.push(*ts);
                         }
                     }
                 }
@@ -6373,18 +6687,8 @@ fn test_event_metadata_updated_successive_updates_emit_independent_events_with_f
     }
 
     assert_eq!(timestamps.len(), 2, "Two successive updates must emit exactly two events");
-    assert_eq!(timestamps.get(0).unwrap(), 1000, "First event time_updated must be 1000");
-    assert_eq!(timestamps.get(1).unwrap(), 2000, "Second event time_updated must be 2000");
-    assert_eq!(
-        timestamps.len(),
-        2,
-        "Two successive updates must emit exactly two events"
-    );
     assert_eq!(timestamps[0], 1000, "First event time_updated must be 1000");
-    assert_eq!(
-        timestamps[1], 2000,
-        "Second event time_updated must be 2000"
-    );
+    assert_eq!(timestamps[1], 2000, "Second event time_updated must be 2000");
 }
 
 // ============================================================================
@@ -6581,13 +6885,45 @@ fn test_event_capacity_changed_successive_calls_emit_independent_events_with_cor
 
     // First change: 50 → 200
     client.set_event_capacity(&organizer, &event_id, &200u32);
+    let first_change = find_event_by_topic(&env, b"capchng").expect("first capchng not emitted");
+    assert_eq!(
+        capacity_change_from_event(first_change),
+        (50, 200),
+        "first event: old=50 new=200"
+    );
+
     // Second change: 200 → 150
     client.set_event_capacity(&organizer, &event_id, &150u32);
+    let second_change = find_event_by_topic(&env, b"capchng").expect("second capchng not emitted");
+    let events1 = env.events().all();
+
+    // Second change: 200 → 150
+    client.set_event_capacity(&organizer, &event_id, &150u32);
+    let events2 = env.events().all();
 
     // Collect all "capchng" events in emission order
     extern crate alloc;
     let mut pairs: alloc::vec::Vec<(u32, u32)> = alloc::vec::Vec::new(); // (old, new)
-    for xdr_event in env.events().all().events() {
+    for xdr_event in events1.events() {
+        if let xdr::ContractEventBody::V0(body) = &xdr_event.body {
+            if let Some(xdr::ScVal::Symbol(sym)) = body.topics.first() {
+                if sym.as_slice() == b"capchng" {
+                    if let xdr::ScVal::Vec(Some(fields)) = &body.data {
+                        let old = match &fields[1] {
+                            xdr::ScVal::U32(v) => *v,
+                            _ => 0,
+                        };
+                        let new = match &fields[2] {
+                            xdr::ScVal::U32(v) => *v,
+                            _ => 0,
+                        };
+                        pairs.push((old, new));
+                    }
+                }
+            }
+        }
+    }
+    for xdr_event in events2.events() {
         if let xdr::ContractEventBody::V0(body) = &xdr_event.body {
             if let Some(xdr::ScVal::Symbol(sym)) = body.topics.first() {
                 if sym.as_slice() == b"capchng" {
@@ -6608,10 +6944,138 @@ fn test_event_capacity_changed_successive_calls_emit_independent_events_with_cor
     }
 
     assert_eq!(
-        pairs.len(),
-        2,
-        "two successive capacity changes must emit exactly two events"
+        capacity_change_from_event(second_change),
+        (200, 150),
+        "second event: old=200 new=150"
     );
-    assert_eq!(pairs[0], (50, 200), "first event: old=50 new=200");
-    assert_eq!(pairs[1], (200, 150), "second event: old=200 new=150");
+}
+
+#[test]
+fn test_dynamic_venue_space_allocation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_admin, client) = create_test_contract(&env);
+    let organizer = Address::generate(&env);
+    let event_id = create_and_publish_event(&env, &client, &organizer);
+
+    let venue = String::from_str(&env, "Arena");
+    let space = String::from_str(&env, "Hall A");
+
+    // Test allocate_venue_space
+    let result = client.try_allocate_venue_space(&organizer, &event_id, &venue, &space, &100u32);
+    assert!(result.is_ok());
+
+    // Test manage_venue_conflicts (no conflicts)
+    let conflicts = client.manage_venue_conflicts(&organizer, &venue, &space);
+    assert_eq!(conflicts, false);
+
+    // Create a second event in the same space at overlapping times
+    let event_id_2 = create_and_publish_event(&env, &client, &organizer);
+    client.allocate_venue_space(&organizer, &event_id_2, &venue, &space, &200u32);
+
+    // Test manage_venue_conflicts (conflict detected due to overlap)
+    let conflicts_2 = client.manage_venue_conflicts(&organizer, &venue, &space);
+    assert_eq!(conflicts_2, true);
+
+    // Test optimize_space_utilization
+    let opt = client.try_optimize_space_utilization(&organizer, &venue, &space);
+    assert!(opt.is_ok());
+}
+
+#[test]
+fn test_subscription_based_passes() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = create_test_contract(&env);
+    let organizer = Address::generate(&env);
+    let subscriber = Address::generate(&env);
+
+    // Set token for billing
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_address = token_contract.address();
+    let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+    let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+    client.set_token(&admin, &token_address);
+
+    // Mint tokens to subscriber
+    token_admin_client.mint(&subscriber, &1000i128);
+
+    let name = String::from_str(&env, "Gold Pass");
+    // Test create_subscription_plan
+    let plan_id = client.create_subscription_plan(&organizer, &1u64, &name, &100i128, &3600u64);
+
+    // Test process_recurring_billing
+    let bill = client.try_process_recurring_billing(&subscriber, &plan_id);
+    assert!(bill.is_ok());
+
+    // Verify balance was transferred
+    assert_eq!(token_client.balance(&subscriber), 900i128);
+
+    // Test validate_subscription_status
+    let status = client.validate_subscription_status(&subscriber, &plan_id);
+    assert_eq!(status, true);
+
+    // Advance ledger time past expiration
+    env.ledger().with_mut(|li| li.timestamp = 4000);
+
+    // Verify subscription status is now expired
+    let expired = client.validate_subscription_status(&subscriber, &plan_id);
+    assert_eq!(expired, false);
+}
+
+#[test]
+fn test_security_monitoring() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = create_test_contract(&env);
+    let target = Address::generate(&env);
+
+    // Test monitor_security_threats
+    let mon = client.try_monitor_security_threats(&admin, &target, &50u32);
+    assert!(mon.is_ok());
+
+    // Test detect_suspicious_activity
+    let activity = String::from_str(&env, "transfer_spam");
+    let detected = client.detect_suspicious_activity(&admin, &target, &activity);
+    assert_eq!(detected, true);
+
+    // Test respond_to_incidents
+    let act = String::from_str(&env, "block_address");
+    let resp = client.try_respond_to_incidents(&admin, &1u64, &act);
+    assert!(resp.is_ok());
+}
+
+#[test]
+fn test_personalization_engine() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_admin, client) = create_test_contract(&env);
+    let user = Address::generate(&env);
+    let organizer = Address::generate(&env);
+
+    // Create an event with price 100
+    let event_id = create_and_publish_event(&env, &client, &organizer);
+
+    let mut categories = soroban_sdk::Vec::new(&env);
+    categories.push_back(String::from_str(&env, "Concerts"));
+
+    // Test personalize_user_experience
+    let pers = client.try_personalize_user_experience(&user, &categories, &150i128);
+    assert!(pers.is_ok());
+
+    // Test customize_event_recommendations
+    let rec_list = client.customize_event_recommendations(&user);
+    assert_eq!(rec_list.len(), 1);
+    assert_eq!(rec_list.get(0).unwrap(), event_id);
+
+    // Test optimize_user_journey
+    let mut steps = soroban_sdk::Vec::new(&env);
+    steps.push_back(String::from_str(&env, "view_details"));
+    let opt = client.try_optimize_user_journey(&user, &steps);
+    assert!(opt.is_ok());
 }

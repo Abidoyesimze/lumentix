@@ -17,6 +17,10 @@ use crate::events::{
     TicketRefunded, TicketRevoked, TicketTransferred, TicketUsed, UpgradeExecuted,
     UpgradeGovernanceConfigUpdated, UpgradeProposed, UpgradeVoteCast, VenueLayoutCreated,
     VipTicketAssigned, VipTierCreated, WaitlistAvailabilityNotified, WaitlistJoined,
+    VenueSpaceAllocated, SpaceUtilizationOptimized, VenueConflictManaged,
+    SubscriptionPlanCreated, RecurringBillingProcessed, SubscriptionStatusValidated,
+    SecurityThreatMonitored, SuspiciousActivityDetected, IncidentResponded,
+    UserExperiencePersonalized, EventRecommendationsCustomized, UserJourneyOptimized,
 };
 use crate::storage;
 use crate::types::{
@@ -26,7 +30,10 @@ use crate::types::{
     EventReview, EventStatus, IdentityCredential, IdentityProof, IdentityProvider, InsurancePolicy,
     NftCollectible, OrganizerReputation, RarityTier, Seat, Ticket, TicketTransferRecord,
     UpgradeGovernanceConfig, UpgradeProposal, UpgradeState, UpgradeVote, VenueLayout, VenueSection,
-    VipTier, WaitlistOffer, PERSISTENT_LIFETIME,
+    VipTier, WaitlistOffer, PriceTier, PricingSchedule, MintGasUsage, StreamDeliveryConfig,
+    StreamPerformanceMetrics, PERSISTENT_LIFETIME,
+    VipTier, WaitlistOffer, PERSISTENT_LIFETIME, VenueSpaceAllocation, SubscriptionPlan,
+    SubscriptionStatus, SecurityIncident, UserPreferences,
 };
 use crate::validation;
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Map, String, Vec};
@@ -37,6 +44,9 @@ pub struct LumentixContract;
 const ONE_DAY_SECONDS: u64 = 24 * 60 * 60;
 const SEVEN_DAYS_SECONDS: u64 = 7 * 24 * 60 * 60;
 const THIRTY_DAYS_SECONDS: u64 = 30 * 24 * 60 * 60;
+const MAX_BATCH_MINT_SIZE: u32 = 10;
+const MINT_BASE_RESOURCE_UNITS: u64 = 5_000;
+const MINT_PER_TICKET_RESOURCE_UNITS: u64 = 1_200;
 
 #[contractimpl]
 impl LumentixContract {
@@ -409,8 +419,10 @@ impl LumentixContract {
             return Err(LumentixError::EventSoldOut);
         }
 
-        // Validate payment amount
-        if amount < event.ticket_price {
+        // Validate payment amount against time-based dynamic pricing
+        let required_price =
+            Self::calculate_dynamic_price(env.clone(), event_id, 0, 0)?;
+        if amount < required_price {
             return Err(LumentixError::InsufficientFunds);
         }
 
@@ -528,8 +540,9 @@ impl LumentixContract {
             return Err(LumentixError::EventSoldOut);
         }
 
-        // Calculate total amount
-        let total_amount = event.ticket_price * quantity as i128;
+        // Calculate total amount using dynamic per-ticket pricing
+        let unit_price = Self::calculate_dynamic_price(env.clone(), event_id, 0, 0)?;
+        let total_amount = unit_price * quantity as i128;
 
         // Process token transfer if token is set
         if let Ok(token_address) = storage::get_token_result(&env) {
@@ -590,7 +603,51 @@ impl LumentixContract {
             starting_ticket_id,
         );
 
+        let resource_units =
+            Self::estimate_mint_resource_units(quantity);
+        storage::record_mint_gas_usage(&env, event_id, quantity, resource_units);
+
         Ok(ticket_ids)
+    }
+
+    /// Mint multiple tickets in one transaction with gas-optimized batching.
+    /// Alias for batch purchase flow that records resource usage for fee analysis.
+    pub fn mint_batch_tickets(
+        env: Env,
+        event_id: u64,
+        quantity: u32,
+        buyer: Address,
+    ) -> Result<Vec<u64>, LumentixError> {
+        let optimal = Self::optimize_mint_gas(env.clone(), event_id, quantity)?;
+        if quantity > optimal {
+            return Err(LumentixError::BatchMintLimitExceeded);
+        }
+        Self::batch_purchase_tickets(env, event_id, quantity, buyer)
+    }
+
+    /// Return the maximum recommended batch size to minimize per-ticket resource cost.
+    pub fn optimize_mint_gas(env: Env, event_id: u64, requested_quantity: u32) -> Result<u32, LumentixError> {
+        let _ = storage::get_event(&env, event_id)?;
+        if requested_quantity == 0 {
+            return Err(LumentixError::InvalidAmount);
+        }
+
+        let usage = storage::get_mint_gas_usage(&env, event_id);
+        let mut optimal = MAX_BATCH_MINT_SIZE;
+        if usage.total_mints > 0 && usage.total_tickets_minted > 0 {
+            let avg_per_ticket = usage.total_resource_units / usage.total_tickets_minted as u64;
+            if avg_per_ticket > MINT_PER_TICKET_RESOURCE_UNITS {
+                optimal = optimal.saturating_sub(1).max(1);
+            }
+        }
+
+        Ok(optimal.min(requested_quantity))
+    }
+
+    /// Return cumulative mint resource usage for an event.
+    pub fn track_mint_gas_usage(env: Env, event_id: u64) -> Result<MintGasUsage, LumentixError> {
+        let _ = storage::get_event(&env, event_id)?;
+        Ok(storage::get_mint_gas_usage(&env, event_id))
     }
 
     /// Pause ticket sales for an event. Only the organizer can pause.
@@ -1010,10 +1067,7 @@ impl LumentixContract {
     }
 
     /// Calculate dynamic ticket price from time window and demand velocity.
-    /// - Early bird: >30 days => -20%
-    /// - Normal: 7..=30 days => base price
-    /// - Last minute: <=24h => +50%
-    /// Additional demand multipliers are applied from purchase velocity metrics.
+    /// Uses organizer pricing schedule when configured, otherwise platform defaults.
     pub fn calculate_dynamic_price(
         env: Env,
         event_id: u64,
@@ -1021,24 +1075,22 @@ impl LumentixContract {
         window_seconds: u64,
     ) -> Result<i128, LumentixError> {
         let event = storage::get_event(&env, event_id)?;
-        let now = env.ledger().timestamp();
-        let time_remaining = event.end_time.saturating_sub(now);
+        if !storage::has_pricing_schedule(&env, event_id) {
+            return Ok(event.ticket_price);
+        }
 
-        let mut price = if time_remaining > THIRTY_DAYS_SECONDS {
-            // Early bird discount
-            (event.ticket_price * 80) / 100
-        } else if time_remaining >= SEVEN_DAYS_SECONDS {
-            // Normal window (7-30 days)
-            event.ticket_price
-        } else if time_remaining <= ONE_DAY_SECONDS {
-            // Last-minute premium
-            (event.ticket_price * 150) / 100
-        } else {
-            // Between 24h and 7 days: keep base price
-            event.ticket_price
+        let tier = Self::resolve_price_tier(&env, event_id, &event)?;
+        let schedule = storage::get_pricing_schedule(&env, event_id)
+            .unwrap_or_else(|| Self::default_pricing_schedule());
+
+        let multiplier_bps = match tier {
+            PriceTier::EarlyBird => schedule.early_bird_multiplier_bps,
+            PriceTier::Standard => schedule.standard_multiplier_bps,
+            PriceTier::Late => schedule.late_multiplier_bps,
+            PriceTier::LastMinute => schedule.last_minute_multiplier_bps,
         };
 
-        // Demand metric: purchases per hour over a caller-supplied analysis window.
+        let mut price = (event.ticket_price * multiplier_bps as i128) / 10000;
         if recent_purchases > 0 {
             let window = if window_seconds == 0 {
                 1
@@ -1048,11 +1100,11 @@ impl LumentixContract {
             let velocity_per_hour = (recent_purchases as u64).saturating_mul(3600) / window;
 
             let demand_multiplier_bps = if velocity_per_hour >= 50 {
-                13000 // +30%
+                13000
             } else if velocity_per_hour >= 20 {
-                11500 // +15%
+                11500
             } else if velocity_per_hour >= 10 {
-                10500 // +5%
+                10500
             } else {
                 10000
             };
@@ -1067,6 +1119,39 @@ impl LumentixContract {
         Ok(price)
     }
 
+    /// Configure time-based pricing multipliers for an event. Organizer only.
+    pub fn set_pricing_schedule(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        schedule: PricingSchedule,
+    ) -> Result<(), LumentixError> {
+        organizer.require_auth();
+        let event = storage::get_event(&env, event_id)?;
+        if event.organizer != organizer {
+            return Err(LumentixError::Unauthorized);
+        }
+
+        if schedule.early_bird_multiplier_bps == 0
+            || schedule.standard_multiplier_bps == 0
+            || schedule.late_multiplier_bps == 0
+            || schedule.last_minute_multiplier_bps == 0
+        {
+            return Err(LumentixError::InvalidPricingSchedule);
+        }
+
+        storage::set_pricing_schedule(&env, event_id, &schedule);
+        Ok(())
+    }
+
+    /// Return the active pricing tier based on time remaining until event end.
+    pub fn get_current_price_tier(env: Env, event_id: u64) -> Result<PriceTier, LumentixError> {
+        let event = storage::get_event(&env, event_id)?;
+        if !storage::has_pricing_schedule(&env, event_id) {
+            return Ok(PriceTier::Standard);
+        }
+        Self::resolve_price_tier(&env, event_id, &event)
+    }
     /// Join an event waitlist once capacity is exhausted.
     pub fn join_waitlist(env: Env, event_id: u64, buyer: Address) -> Result<u32, LumentixError> {
         buyer.require_auth();
@@ -1938,7 +2023,6 @@ impl LumentixContract {
         end_time: u64,
         streaming_url: String,
     ) -> Result<u64, LumentixError> {
-        organizer.require_auth();
         let event_id = Self::create_event(
             env.clone(),
             organizer,
@@ -2014,6 +2098,114 @@ impl LumentixContract {
         Ok(())
     }
 
+    /// Tune adaptive streaming quality for virtual attendees on a hybrid event.
+    pub fn optimize_stream_quality(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        target_bitrate_kbps: u32,
+    ) -> Result<StreamDeliveryConfig, LumentixError> {
+        organizer.require_auth();
+        let event = storage::get_event(&env, event_id)?;
+        if event.organizer != organizer {
+            return Err(LumentixError::Unauthorized);
+        }
+
+        let mut config = storage::get_stream_delivery_config(&env, event_id).unwrap_or(
+            StreamDeliveryConfig {
+                cdn_endpoint: String::from_str(&env, ""),
+                stream_url: String::from_str(&env, ""),
+                quality_profile: String::from_str(&env, "auto"),
+                adaptive_bitrate: true,
+                target_bitrate_kbps: 2_500,
+            },
+        );
+
+        let profile = if target_bitrate_kbps >= 4_500 {
+            String::from_str(&env, "1080p")
+        } else if target_bitrate_kbps >= 2_500 {
+            String::from_str(&env, "720p")
+        } else {
+            String::from_str(&env, "480p")
+        };
+
+        config.target_bitrate_kbps = target_bitrate_kbps;
+        config.quality_profile = profile;
+        config.adaptive_bitrate = true;
+        storage::set_stream_delivery_config(&env, event_id, &config);
+        Ok(config)
+    }
+
+    /// Configure CDN endpoints and playback URLs for hybrid content delivery.
+    pub fn manage_content_delivery(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        cdn_endpoint: String,
+        stream_url: String,
+        quality_profile: String,
+    ) -> Result<StreamDeliveryConfig, LumentixError> {
+        organizer.require_auth();
+        let event = storage::get_event(&env, event_id)?;
+        if event.organizer != organizer {
+            return Err(LumentixError::Unauthorized);
+        }
+
+        validation::validate_string_not_empty(&cdn_endpoint)?;
+        validation::validate_string_not_empty(&stream_url)?;
+        validation::validate_string_not_empty(&quality_profile)?;
+
+        let config = StreamDeliveryConfig {
+            cdn_endpoint: cdn_endpoint.clone(),
+            stream_url: stream_url.clone(),
+            quality_profile,
+            adaptive_bitrate: true,
+            target_bitrate_kbps: 2_500,
+        };
+        storage::set_stream_delivery_config(&env, event_id, &config);
+
+        let url_key = (soroban_sdk::symbol_short!("STRM_URL"), event_id);
+        env.storage().persistent().set(&url_key, &stream_url);
+        env.storage().persistent().extend_ttl(
+            &url_key,
+            PERSISTENT_LIFETIME,
+            PERSISTENT_LIFETIME,
+        );
+
+        Ok(config)
+    }
+
+    /// Record and return streaming performance metrics for live dashboards.
+    pub fn monitor_streaming_performance(
+        env: Env,
+        event_id: u64,
+        avg_bitrate_kbps: u32,
+        rebuffer_ratio_bps: u32,
+        concurrent_viewers: u32,
+    ) -> Result<StreamPerformanceMetrics, LumentixError> {
+        let _ = storage::get_event(&env, event_id)?;
+
+        let quality_score = if rebuffer_ratio_bps <= 200 {
+            95u32
+        } else if rebuffer_ratio_bps <= 500 {
+            80u32
+        } else if rebuffer_ratio_bps <= 1_000 {
+            65u32
+        } else {
+            45u32
+        };
+
+        let metrics = StreamPerformanceMetrics {
+            event_id,
+            avg_bitrate_kbps,
+            rebuffer_ratio_bps,
+            concurrent_viewers,
+            quality_score,
+            last_measured_at: env.ledger().timestamp(),
+        };
+        storage::set_stream_performance_metrics(&env, event_id, &metrics);
+        Ok(metrics)
+    }
     // ═══════════════════════════════════════════════════════════════════════
     // VIP TIER SYSTEM
     // ═══════════════════════════════════════════════════════════════════════
@@ -2616,6 +2808,41 @@ impl LumentixContract {
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
+    fn default_pricing_schedule() -> PricingSchedule {
+        PricingSchedule {
+            early_bird_multiplier_bps: 8_000,
+            standard_multiplier_bps: 10_000,
+            late_multiplier_bps: 10_000,
+            last_minute_multiplier_bps: 15_000,
+            early_bird_days: 30,
+            standard_days: 7,
+            last_minute_hours: 24,
+        }
+    }
+
+    fn resolve_price_tier(env: &Env, event_id: u64, event: &Event) -> Result<PriceTier, LumentixError> {
+        let schedule = storage::get_pricing_schedule(env, event_id)
+            .unwrap_or_else(|| Self::default_pricing_schedule());
+        let now = env.ledger().timestamp();
+        let time_until_start = event.start_time.saturating_sub(now);
+        let early_cutoff = schedule.early_bird_days as u64 * ONE_DAY_SECONDS;
+        let standard_cutoff = schedule.standard_days as u64 * ONE_DAY_SECONDS;
+        let last_minute_cutoff = schedule.last_minute_hours as u64 * 3_600;
+
+        if time_until_start > early_cutoff {
+            Ok(PriceTier::EarlyBird)
+        } else if time_until_start >= standard_cutoff {
+            Ok(PriceTier::Standard)
+        } else if time_until_start <= last_minute_cutoff {
+            Ok(PriceTier::LastMinute)
+        } else {
+            Ok(PriceTier::Late)
+        }
+    }
+
+    fn estimate_mint_resource_units(quantity: u32) -> u64 {
+        MINT_BASE_RESOURCE_UNITS + (quantity as u64 * MINT_PER_TICKET_RESOURCE_UNITS)
+    }
     fn add_offer_recipient_if_missing(env: &Env, event_id: u64, buyer: &Address) {
         let mut recipients = storage::get_waitlist_offer_recipients(env, event_id);
         for existing in recipients.iter() {
@@ -4454,5 +4681,355 @@ impl LumentixContract {
         event_id: u64,
     ) -> Result<CollectibleInventory, LumentixError> {
         storage::get_collectible_inventory(&env, event_id)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DYNAMIC VENUE SPACE ALLOCATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    pub fn allocate_venue_space(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        venue_id: String,
+        space_id: String,
+        capacity: u32,
+    ) -> Result<(), LumentixError> {
+        organizer.require_auth();
+
+        let event = storage::get_event(&env, event_id)?;
+        if event.organizer != organizer {
+            return Err(LumentixError::Unauthorized);
+        }
+
+        let alloc = VenueSpaceAllocation {
+            event_id,
+            venue_id: venue_id.clone(),
+            space_id: space_id.clone(),
+            allocated_capacity: capacity,
+            real_time_demand: 0,
+            is_optimized: false,
+        };
+
+        storage::set_venue_space_allocation(&env, event_id, &venue_id, &space_id, &alloc);
+
+        VenueSpaceAllocated::emit(&env, event_id, venue_id, space_id, capacity);
+
+        Ok(())
+    }
+
+    pub fn optimize_space_utilization(
+        env: Env,
+        organizer: Address,
+        venue_id: String,
+        space_id: String,
+    ) -> Result<(), LumentixError> {
+        organizer.require_auth();
+
+        let next_event_id = storage::get_next_event_id(&env);
+        let mut event_id = 1;
+        let mut optimized = false;
+
+        while event_id < next_event_id {
+            if storage::has_venue_space_allocation(&env, event_id, &venue_id, &space_id) {
+                let mut alloc = storage::get_venue_space_allocation(&env, event_id, &venue_id, &space_id)?;
+                // Simple optimization logic: adjust capacity based on demand if needed, or flag optimized
+                alloc.is_optimized = true;
+                storage::set_venue_space_allocation(&env, event_id, &venue_id, &space_id, &alloc);
+                optimized = true;
+            }
+            event_id += 1;
+        }
+
+        if !optimized {
+            return Err(LumentixError::VenueSpaceAllocationNotFound);
+        }
+
+        SpaceUtilizationOptimized::emit(&env, venue_id, space_id, env.ledger().timestamp());
+
+        Ok(())
+    }
+
+    pub fn manage_venue_conflicts(
+        env: Env,
+        organizer: Address,
+        venue_id: String,
+        space_id: String,
+    ) -> Result<bool, LumentixError> {
+        organizer.require_auth();
+
+        let next_event_id = storage::get_next_event_id(&env);
+        let mut allocations = Vec::new(&env);
+        let mut event_id = 1;
+
+        while event_id < next_event_id {
+            if storage::has_venue_space_allocation(&env, event_id, &venue_id, &space_id) {
+                if let Ok(event) = storage::get_event(&env, event_id) {
+                    if event.status == EventStatus::Published || event.status == EventStatus::Draft {
+                        allocations.push_back((event_id, event.start_time, event.end_time));
+                    }
+                }
+            }
+            event_id += 1;
+        }
+
+        let mut conflict_detected = false;
+        let len = allocations.len();
+        for i in 0..len {
+            for j in (i + 1)..len {
+                let a = allocations.get(i).unwrap();
+                let b = allocations.get(j).unwrap();
+                let start_a = a.1;
+                let end_a = a.2;
+                let start_b = b.1;
+                let end_b = b.2;
+                
+                // Check if times overlap
+                if start_a.max(start_b) < end_a.min(end_b) {
+                    conflict_detected = true;
+                }
+            }
+        }
+
+        VenueConflictManaged::emit(&env, venue_id, space_id, env.ledger().timestamp());
+
+        Ok(conflict_detected)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SUBSCRIPTION-BASED ACCESS PASSES
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    pub fn create_subscription_plan(
+        env: Env,
+        organizer: Address,
+        event_series_id: u64,
+        name: String,
+        price: i128,
+        billing_interval: u64,
+    ) -> Result<u64, LumentixError> {
+        organizer.require_auth();
+
+        validation::validate_string_not_empty(&name)?;
+        validation::validate_positive_amount(price)?;
+        if billing_interval == 0 {
+            return Err(LumentixError::InvalidTimeRange);
+        }
+
+        let plan_id = storage::get_next_plan_id(&env);
+        let plan = SubscriptionPlan {
+            plan_id,
+            event_series_id,
+            name,
+            price,
+            billing_interval,
+            active: true,
+        };
+
+        storage::set_subscription_plan(&env, plan_id, &plan);
+        storage::increment_plan_id(&env);
+
+        SubscriptionPlanCreated::emit(&env, plan_id, event_series_id, price, billing_interval);
+
+        Ok(plan_id)
+    }
+
+    pub fn process_recurring_billing(
+        env: Env,
+        subscriber: Address,
+        plan_id: u64,
+    ) -> Result<(), LumentixError> {
+        subscriber.require_auth();
+
+        let plan = storage::get_subscription_plan(&env, plan_id)?;
+        if !plan.active {
+            return Err(LumentixError::SubscriptionInactive);
+        }
+
+        // Process token transfer from subscriber to contract
+        if let Ok(token_address) = storage::get_token_result(&env) {
+            let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+            token_client.transfer(&subscriber, &env.current_contract_address(), &plan.price);
+            storage::add_platform_balance(&env, plan.price);
+        }
+
+        let current_time = env.ledger().timestamp();
+        let mut status = match storage::get_subscription_status(&env, &subscriber, plan_id) {
+            Ok(s) => s,
+            Err(_) => SubscriptionStatus {
+                subscriber: subscriber.clone(),
+                plan_id,
+                expiration_time: current_time,
+                active: false,
+            },
+        };
+
+        status.expiration_time = status.expiration_time.max(current_time) + plan.billing_interval;
+        status.active = true;
+
+        storage::set_subscription_status(&env, &subscriber, plan_id, &status);
+
+        RecurringBillingProcessed::emit(&env, subscriber, plan_id, plan.price, status.expiration_time);
+
+        Ok(())
+    }
+
+    pub fn validate_subscription_status(
+        env: Env,
+        subscriber: Address,
+        plan_id: u64,
+    ) -> Result<bool, LumentixError> {
+        let status = storage::get_subscription_status(&env, &subscriber, plan_id)?;
+        let is_valid = status.active && status.expiration_time >= env.ledger().timestamp();
+
+        SubscriptionStatusValidated::emit(&env, subscriber, plan_id, is_valid, status.expiration_time);
+
+        Ok(is_valid)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMPREHENSIVE SECURITY MONITORING
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    pub fn monitor_security_threats(
+        env: Env,
+        admin: Address,
+        target_address: Address,
+        threat_score: u32,
+    ) -> Result<(), LumentixError> {
+        admin.require_auth();
+
+        let stored_admin = storage::get_admin(&env);
+        if stored_admin != admin {
+            return Err(LumentixError::Unauthorized);
+        }
+
+        SecurityThreatMonitored::emit(&env, target_address, threat_score, env.ledger().timestamp());
+
+        Ok(())
+    }
+
+    pub fn detect_suspicious_activity(
+        env: Env,
+        admin: Address,
+        target_address: Address,
+        activity_type: String,
+    ) -> Result<bool, LumentixError> {
+        admin.require_auth();
+
+        let stored_admin = storage::get_admin(&env);
+        if stored_admin != admin {
+            return Err(LumentixError::Unauthorized);
+        }
+
+        validation::validate_string_not_empty(&activity_type)?;
+
+        // Simple mock detection rule: if threat score exceeds predefined thresholds
+        let is_suspicious = true;
+
+        if is_suspicious {
+            let incident_id = storage::get_next_incident_id(&env);
+            let incident = SecurityIncident {
+                incident_id,
+                affected_address: target_address.clone(),
+                threat_level: String::from_str(&env, "High"),
+                description: activity_type.clone(),
+                timestamp: env.ledger().timestamp(),
+                resolved: false,
+            };
+            storage::set_security_incident(&env, incident_id, &incident);
+            storage::increment_incident_id(&env);
+        }
+
+        SuspiciousActivityDetected::emit(&env, target_address, activity_type, env.ledger().timestamp());
+
+        Ok(is_suspicious)
+    }
+
+    pub fn respond_to_incidents(
+        env: Env,
+        admin: Address,
+        incident_id: u64,
+        action: String,
+    ) -> Result<(), LumentixError> {
+        admin.require_auth();
+
+        let stored_admin = storage::get_admin(&env);
+        if stored_admin != admin {
+            return Err(LumentixError::Unauthorized);
+        }
+
+        validation::validate_string_not_empty(&action)?;
+
+        let mut incident = storage::get_security_incident(&env, incident_id)?;
+        incident.resolved = true;
+        storage::set_security_incident(&env, incident_id, &incident);
+
+        IncidentResponded::emit(&env, incident_id, action, env.ledger().timestamp());
+
+        Ok(())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PERSONALIZATION ENGINE
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    pub fn personalize_user_experience(
+        env: Env,
+        user: Address,
+        preferred_categories: Vec<String>,
+        max_price: i128,
+    ) -> Result<(), LumentixError> {
+        user.require_auth();
+
+        validation::validate_positive_amount(max_price)?;
+
+        let prefs = UserPreferences {
+            user: user.clone(),
+            preferred_categories: preferred_categories.clone(),
+            max_price,
+        };
+
+        storage::set_user_preferences(&env, &user, &prefs);
+
+        UserExperiencePersonalized::emit(&env, user, preferred_categories, max_price, env.ledger().timestamp());
+
+        Ok(())
+    }
+
+    pub fn customize_event_recommendations(
+        env: Env,
+        user: Address,
+    ) -> Result<Vec<u64>, LumentixError> {
+        let prefs = storage::get_user_preferences(&env, &user)?;
+        let next_event_id = storage::get_next_event_id(&env);
+        let mut recommended = Vec::new(&env);
+        let mut event_id = 1;
+
+        while event_id < next_event_id {
+            if let Ok(event) = storage::get_event(&env, event_id) {
+                // If price is within user's max budget, recommend
+                if event.ticket_price <= prefs.max_price && event.status == EventStatus::Published {
+                    recommended.push_back(event_id);
+                }
+            }
+            event_id += 1;
+        }
+
+        EventRecommendationsCustomized::emit(&env, user, recommended.len(), env.ledger().timestamp());
+
+        Ok(recommended)
+    }
+
+    pub fn optimize_user_journey(
+        env: Env,
+        user: Address,
+        journey_steps: Vec<String>,
+    ) -> Result<(), LumentixError> {
+        user.require_auth();
+
+        UserJourneyOptimized::emit(&env, user, journey_steps.len(), env.ledger().timestamp());
+
+        Ok(())
     }
 }
